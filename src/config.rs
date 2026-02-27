@@ -26,7 +26,7 @@ impl Config {
 
         let ch_host = std::env::var("CH_HOST").unwrap_or_else(|_| "localhost".into());
         let ch_port = std::env::var("CH_PORT")
-            .unwrap_or_else(|_| "8123".into())
+            .unwrap_or_else(|_| "9000".into())
             .parse()?;
         let ch_user = std::env::var("CH_USER").unwrap_or_else(|_| "default".into());
         let ch_password = std::env::var("CH_PASSWORD").unwrap_or_else(|_| "test".into());
@@ -53,7 +53,7 @@ impl Config {
         })
     }
 
-    pub fn ch_base_url(&self) -> String {
-        format!("http://{}:{}/", self.ch_host, self.ch_port)
+    pub fn ch_tcp_url(&self) -> String {
+        format!("tcp://{}:{}", self.ch_host, self.ch_port)
     }
 }

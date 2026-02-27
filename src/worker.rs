@@ -1,22 +1,17 @@
 // src/worker.rs
 use anyhow::{Context, Result};
 use chrono::{Months, NaiveDate, Utc};
+use clickhouse_rs::Pool;
 use dashmap::DashMap;
-use futures_util::TryStreamExt;
-use reqwest::Client;
 use std::{collections::HashSet, sync::Arc};
 use teloxide::{
     prelude::*,
     types::{InputFile, ParseMode},
 };
-use tokio::{
-    fs::OpenOptions,
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-};
+use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
 use crate::{
     bot::{UserState, purchase_store},
-    config::Config,
     i18n::{Lang, lang_of},
     keyboards::purchase_action_keyboard,
     queue::{DbTask, SearchKind},
@@ -28,8 +23,7 @@ const CHUNK_SIZE: usize = 2000;
 
 #[derive(Clone)]
 pub struct WorkerDeps {
-    pub cfg: Config,
-    pub http: Client,
+    pub ch_pool: Pool,
 
     /// ✅ активный kind для каждого user_id
     pub active_requests: Arc<DashMap<i64, SearchKind>>,
@@ -208,26 +202,20 @@ async fn handle_task(deps: &WorkerDeps, task: &DbTask) -> Result<()> {
     // threshold для split
     let threshold = today.checked_sub_months(Months::new(3)).unwrap();
 
-    // SQL + params
-    let (sql, params) = build_sql(&task.kind, &task.query);
+    // SQL
+    let sql = build_sql(&task.kind, &task.query);
 
-    let resp = deps
-        .http
-        .post(deps.cfg.ch_base_url())
-        .basic_auth(&deps.cfg.ch_user, Some(&deps.cfg.ch_password))
-        .query(&[("database", deps.cfg.ch_database.as_str())])
-        .query(&params)
-        .body(sql)
-        .send()
+    let mut client = deps
+        .ch_pool
+        .get_handle()
         .await
-        .context("clickhouse request failed")?
-        .error_for_status()?;
+        .context("failed to get clickhouse tcp connection")?;
 
-    let stream = resp.bytes_stream();
-    let reader = tokio_util::io::StreamReader::new(
-        stream.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
-    );
-    let mut lines = BufReader::new(reader).lines();
+    let block = client
+        .query(sql)
+        .fetch_all()
+        .await
+        .context("clickhouse tcp query failed")?;
 
     let mut cnt_new = 0u64;
     let mut cnt_old = 0u64;
@@ -236,8 +224,18 @@ async fn handle_task(deps: &WorkerDeps, task: &DbTask) -> Result<()> {
     let mut preview_entries: Vec<String> = Vec::new();
     let mut buf: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
 
-    while let Some(line) = lines.next_line().await? {
-        buf.push(line);
+    for row in block.rows() {
+        let main_domain: String = row.get("main_domain").unwrap_or_default();
+        let id: String = row.get("id").unwrap_or_default();
+        let url: String = row.get("url_full").unwrap_or_default();
+        let login: String = row.get("login").unwrap_or_default();
+        let password: String = row.get("password").unwrap_or_default();
+        let created_date: String = row.get("created_date").unwrap_or_default();
+
+        buf.push(format!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            main_domain, id, url, login, password, created_date
+        ));
 
         if buf.len() >= CHUNK_SIZE {
             if matches!(task.kind, SearchKind::Login) {
@@ -586,93 +584,89 @@ async fn process_chunk_nosplit(
 }
 
 /// SQL builder
-fn build_sql(kind: &SearchKind, q: &str) -> (String, Vec<(&'static str, String)>) {
+fn build_sql(kind: &SearchKind, q: &str) -> String {
+    let q = escape_sql_string(q);
+
     match kind {
-        SearchKind::Domain => (
+        SearchKind::Domain => format!(
             r#"
 SELECT
     main_domain,
-    id,
+    toString(id) AS id,
     url_full,
     login,
     password,
-    created_date
+    toString(created_date) AS created_date
 FROM leak_data
-WHERE main_domain = {q:String}
-FORMAT TSV
-"#
-            .to_string(),
-            vec![("param_q", q.to_string())],
+WHERE main_domain = '{}'
+"#,
+            q
         ),
 
-        SearchKind::Port => (
+        SearchKind::Port => format!(
             r#"
 SELECT
     main_domain,
-    id,
+    toString(id) AS id,
     url_full,
     login,
     password,
-    created_date
+    toString(created_date) AS created_date
 FROM leak_data
-WHERE port = {q:String}
-FORMAT TSV
-"#
-            .to_string(),
-            vec![("param_q", q.to_string())],
+WHERE port = '{}'
+"#,
+            q
         ),
 
-        SearchKind::Subdomain => (
+        SearchKind::Subdomain => format!(
             r#"
 SELECT
     main_domain,
-    id,
+    toString(id) AS id,
     url_full,
     login,
     password,
-    created_date
+    toString(created_date) AS created_date
 FROM leak_data
-WHERE subdomain ILIKE concat('%', {q:String}, '%')
-FORMAT TSV
-"#
-            .to_string(),
-            vec![("param_q", q.to_string())],
+WHERE subdomain ILIKE concat('%', '{}', '%')
+"#,
+            q
         ),
 
-        SearchKind::Path => (
+        SearchKind::Path => format!(
             r#"
 SELECT
     main_domain,
-    id,
+    toString(id) AS id,
     url_full,
     login,
     password,
-    created_date
+    toString(created_date) AS created_date
 FROM leak_data
-WHERE path ILIKE concat('%', {q:String}, '%')
-FORMAT TSV
-"#
-            .to_string(),
-            vec![("param_q", q.to_string())],
+WHERE path ILIKE concat('%', '{}', '%')
+"#,
+            q
         ),
 
-        SearchKind::Login => (
+        SearchKind::Login => format!(
             r#"
 SELECT
     main_domain,
-    id,
+    toString(id) AS id,
     url_full,
     login,
     password,
-    created_date
+    toString(created_date) AS created_date
 FROM leak_data
-WHERE login = {q:String}
-FORMAT TSV
-"#
-            .to_string(),
-            vec![("param_q", q.to_string())],
+WHERE login = '{}'
+"#,
+            q
         ),
     }
+}
+
+fn escape_sql_string(input: &str) -> String {
+    input.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
 fn make_preview_line(kind: &SearchKind, url: &str, login: &str, pass: &str) -> String {

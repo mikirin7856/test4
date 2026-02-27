@@ -56,9 +56,15 @@ async fn main() -> Result<()> {
     // ==========================
     let (db_tx, db_rx) = mpsc::channel::<queue::DbTask>(cfg.db_queue_maxsize);
 
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(cfg.query_timeout))
-        .build()?;
+    let ch_url = format!(
+        "{}?user={}&password={}&database={}&ping_timeout={}s",
+        cfg.ch_tcp_url(),
+        cfg.ch_user,
+        cfg.ch_password,
+        cfg.ch_database,
+        cfg.query_timeout
+    );
+    let ch_pool = clickhouse_rs::Pool::new(ch_url);
 
     let (trigger, shutdown) = shutdown_channel();
 
@@ -66,8 +72,7 @@ async fn main() -> Result<()> {
     // WORKER
     // ==========================
     let worker_deps = WorkerDeps {
-        cfg: cfg.clone(),
-        http,
+        ch_pool,
         active_requests: active_requests.clone(),
         bot: bot.clone(),
         sold_store: sold_store.clone(),
