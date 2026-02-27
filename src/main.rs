@@ -12,8 +12,7 @@ mod shutdown;
 mod sold_store;
 mod worker;
 
-use anyhow::{Context, Result};
-use clickhouse_rs::Pool;
+use anyhow::Result;
 use dashmap::DashMap;
 use std::sync::Arc;
 use teloxide::prelude::*;
@@ -57,20 +56,9 @@ async fn main() -> Result<()> {
     // ==========================
     let (db_tx, db_rx) = mpsc::channel::<queue::DbTask>(cfg.db_queue_maxsize);
 
-    let ch_pool = Pool::new(cfg.ch_dsn());
-
-    // Fast fail on startup if DB is unreachable/misconfigured.
-    {
-        let mut handle = ch_pool
-            .get_handle()
-            .await
-            .context("failed to establish ClickHouse native TCP connection")?;
-        let _: clickhouse_rs::types::Block = handle
-            .query("SELECT 1")
-            .fetch_all()
-            .await
-            .context("clickhouse startup ping failed")?;
-    }
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(cfg.query_timeout))
+        .build()?;
 
     let (trigger, shutdown) = shutdown_channel();
 
@@ -79,7 +67,7 @@ async fn main() -> Result<()> {
     // ==========================
     let worker_deps = WorkerDeps {
         cfg: cfg.clone(),
-        ch_pool,
+        http,
         active_requests: active_requests.clone(),
         bot: bot.clone(),
         sold_store: sold_store.clone(),
