@@ -1,18 +1,14 @@
 // src/worker.rs
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{Months, NaiveDate, Utc};
+use clickhouse_rs::{Pool, types::Block};
 use dashmap::DashMap;
-use futures_util::TryStreamExt;
-use reqwest::Client;
 use std::{collections::HashSet, sync::Arc};
 use teloxide::{
     prelude::*,
     types::{InputFile, ParseMode},
 };
-use tokio::{
-    fs::OpenOptions,
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-};
+use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
 use crate::{
     bot::{UserState, purchase_store},
@@ -29,7 +25,7 @@ const CHUNK_SIZE: usize = 2000;
 #[derive(Clone)]
 pub struct WorkerDeps {
     pub cfg: Config,
-    pub http: Client,
+    pub ch_pool: Pool,
 
     /// ✅ активный kind для каждого user_id
     pub active_requests: Arc<DashMap<i64, SearchKind>>,
@@ -208,26 +204,8 @@ async fn handle_task(deps: &WorkerDeps, task: &DbTask) -> Result<()> {
     // threshold для split
     let threshold = today.checked_sub_months(Months::new(3)).unwrap();
 
-    // SQL + params
-    let (sql, params) = build_sql(&task.kind, &task.query);
-
-    let resp = deps
-        .http
-        .post(deps.cfg.ch_base_url())
-        .basic_auth(&deps.cfg.ch_user, Some(&deps.cfg.ch_password))
-        .query(&[("database", deps.cfg.ch_database.as_str())])
-        .query(&params)
-        .body(sql)
-        .send()
-        .await
-        .context("clickhouse request failed")?
-        .error_for_status()?;
-
-    let stream = resp.bytes_stream();
-    let reader = tokio_util::io::StreamReader::new(
-        stream.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
-    );
-    let mut lines = BufReader::new(reader).lines();
+    // SQL
+    let sql = build_sql(&task.kind, &task.query);
 
     let mut cnt_new = 0u64;
     let mut cnt_old = 0u64;
@@ -236,7 +214,21 @@ async fn handle_task(deps: &WorkerDeps, task: &DbTask) -> Result<()> {
     let mut preview_entries: Vec<String> = Vec::new();
     let mut buf: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
 
-    while let Some(line) = lines.next_line().await? {
+    let block = execute_query_with_retry(deps, &sql)
+        .await
+        .context("clickhouse request failed")?;
+
+    for row in block.rows() {
+        let line = format!(
+            "{}	{}	{}	{}	{}	{}",
+            row.get::<String, _>("main_domain")?,
+            row.get::<String, _>("id")?,
+            row.get::<String, _>("url_full")?,
+            row.get::<String, _>("login")?,
+            row.get::<String, _>("password")?,
+            row.get::<String, _>("created_date")?,
+        );
+
         buf.push(line);
 
         if buf.len() >= CHUNK_SIZE {
@@ -585,10 +577,45 @@ async fn process_chunk_nosplit(
     Ok(())
 }
 
+async fn execute_query_with_retry(deps: &WorkerDeps, sql: &str) -> Result<Block> {
+    let mut last_error = None;
+
+    for attempt in 1..=3 {
+        let mut handle = deps.ch_pool.get_handle().await.with_context(|| {
+            format!("failed to get clickhouse connection from pool (attempt {attempt})")
+        })?;
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(deps.cfg.query_timeout),
+            handle.query(sql).fetch_all(),
+        )
+        .await
+        {
+            Ok(Ok(block)) => return Ok(block),
+            Ok(Err(e)) => {
+                last_error = Some(
+                    anyhow!(e).context(format!("clickhouse query failed (attempt {attempt})")),
+                );
+            }
+            Err(e) => {
+                last_error = Some(
+                    anyhow!(e).context(format!("clickhouse query timeout (attempt {attempt})")),
+                );
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200 * attempt)).await;
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("clickhouse query failed with unknown error")))
+}
+
 /// SQL builder
-fn build_sql(kind: &SearchKind, q: &str) -> (String, Vec<(&'static str, String)>) {
+fn build_sql(kind: &SearchKind, q: &str) -> String {
+    let q = sql_quote(q);
+
     match kind {
-        SearchKind::Domain => (
+        SearchKind::Domain => format!(
             r#"
 SELECT
     main_domain,
@@ -598,14 +625,12 @@ SELECT
     password,
     created_date
 FROM leak_data
-WHERE main_domain = {q:String}
+WHERE main_domain = '{q}'
 FORMAT TSV
 "#
-            .to_string(),
-            vec![("param_q", q.to_string())],
         ),
 
-        SearchKind::Port => (
+        SearchKind::Port => format!(
             r#"
 SELECT
     main_domain,
@@ -615,14 +640,12 @@ SELECT
     password,
     created_date
 FROM leak_data
-WHERE port = {q:String}
+WHERE port = '{q}'
 FORMAT TSV
 "#
-            .to_string(),
-            vec![("param_q", q.to_string())],
         ),
 
-        SearchKind::Subdomain => (
+        SearchKind::Subdomain => format!(
             r#"
 SELECT
     main_domain,
@@ -632,14 +655,12 @@ SELECT
     password,
     created_date
 FROM leak_data
-WHERE subdomain ILIKE concat('%', {q:String}, '%')
+WHERE subdomain ILIKE concat('%', '{q}', '%')
 FORMAT TSV
 "#
-            .to_string(),
-            vec![("param_q", q.to_string())],
         ),
 
-        SearchKind::Path => (
+        SearchKind::Path => format!(
             r#"
 SELECT
     main_domain,
@@ -649,14 +670,12 @@ SELECT
     password,
     created_date
 FROM leak_data
-WHERE path ILIKE concat('%', {q:String}, '%')
+WHERE path ILIKE concat('%', '{q}', '%')
 FORMAT TSV
 "#
-            .to_string(),
-            vec![("param_q", q.to_string())],
         ),
 
-        SearchKind::Login => (
+        SearchKind::Login => format!(
             r#"
 SELECT
     main_domain,
@@ -666,13 +685,15 @@ SELECT
     password,
     created_date
 FROM leak_data
-WHERE login = {q:String}
+WHERE login = '{q}'
 FORMAT TSV
 "#
-            .to_string(),
-            vec![("param_q", q.to_string())],
         ),
     }
+}
+
+fn sql_quote(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "''")
 }
 
 fn make_preview_line(kind: &SearchKind, url: &str, login: &str, pass: &str) -> String {
