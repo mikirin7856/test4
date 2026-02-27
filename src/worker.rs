@@ -1,18 +1,15 @@
 // src/worker.rs
 use anyhow::{Context, Result};
 use chrono::{Months, NaiveDate, Utc};
+use clickhouse_rs::Pool;
 use dashmap::DashMap;
 use futures_util::TryStreamExt;
-use reqwest::Client;
 use std::{collections::HashSet, sync::Arc};
 use teloxide::{
     prelude::*,
     types::{InputFile, ParseMode},
 };
-use tokio::{
-    fs::OpenOptions,
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-};
+use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
 use crate::{
     bot::{UserState, purchase_store},
@@ -29,7 +26,7 @@ const CHUNK_SIZE: usize = 2000;
 #[derive(Clone)]
 pub struct WorkerDeps {
     pub cfg: Config,
-    pub http: Client,
+    pub clickhouse_pool: Pool,
 
     /// ✅ активный kind для каждого user_id
     pub active_requests: Arc<DashMap<i64, SearchKind>>,
@@ -211,24 +208,6 @@ async fn handle_task(deps: &WorkerDeps, task: &DbTask) -> Result<()> {
     // SQL + params
     let (sql, params) = build_sql(&task.kind, &task.query);
 
-    let resp = deps
-        .http
-        .post(deps.cfg.ch_base_url())
-        .basic_auth(&deps.cfg.ch_user, Some(&deps.cfg.ch_password))
-        .query(&[("database", deps.cfg.ch_database.as_str())])
-        .query(&params)
-        .body(sql)
-        .send()
-        .await
-        .context("clickhouse request failed")?
-        .error_for_status()?;
-
-    let stream = resp.bytes_stream();
-    let reader = tokio_util::io::StreamReader::new(
-        stream.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
-    );
-    let mut lines = BufReader::new(reader).lines();
-
     let mut cnt_new = 0u64;
     let mut cnt_old = 0u64;
 
@@ -236,37 +215,85 @@ async fn handle_task(deps: &WorkerDeps, task: &DbTask) -> Result<()> {
     let mut preview_entries: Vec<String> = Vec::new();
     let mut buf: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
 
-    while let Some(line) = lines.next_line().await? {
-        buf.push(line);
+    let mut attempt = 0u8;
+    loop {
+        let query_result: Result<()> = async {
+            let mut ch = deps
+                .clickhouse_pool
+                .get_handle()
+                .await
+                .context("clickhouse tcp connection failed")?;
 
-        if buf.len() >= CHUNK_SIZE {
-            if matches!(task.kind, SearchKind::Login) {
-                process_chunk_nosplit(
-                    deps,
-                    &task.kind,
-                    &mut buf,
-                    &mut f_new,
-                    &mut cnt_new,
-                    &mut unique,
-                    &mut preview_entries,
-                )
-                .await?;
-            } else {
-                let f_old = f_old_opt.as_mut().expect("old file must exist");
-                process_chunk_split(
-                    deps,
-                    &task.kind,
-                    &mut buf,
-                    threshold,
-                    &mut f_new,
-                    f_old,
-                    &mut cnt_new,
-                    &mut cnt_old,
-                    &mut unique,
-                    &mut preview_entries,
-                )
-                .await?;
+            let mut query = ch.query(&sql);
+            for (param_name, value) in &params {
+                let key = param_name.trim_start_matches("param_");
+                query = query.bind((key, value.as_str()));
             }
+
+            let mut blocks = query.stream_blocks();
+
+            while let Some(block) = blocks
+                .try_next()
+                .await
+                .context("streaming CH blocks failed")?
+            {
+                for row in block.rows() {
+                    let line = format!(
+                        "{}	{}	{}	{}	{}	{}",
+                        row.get::<String, _>("main_domain")?,
+                        row.get::<String, _>("id")?,
+                        row.get::<String, _>("url_full")?,
+                        row.get::<String, _>("login")?,
+                        row.get::<String, _>("password")?,
+                        row.get::<String, _>("created_date")?,
+                    );
+
+                    buf.push(line);
+
+                    if buf.len() >= CHUNK_SIZE {
+                        if matches!(task.kind, SearchKind::Login) {
+                            process_chunk_nosplit(
+                                deps,
+                                &task.kind,
+                                &mut buf,
+                                &mut f_new,
+                                &mut cnt_new,
+                                &mut unique,
+                                &mut preview_entries,
+                            )
+                            .await?;
+                        } else {
+                            let f_old = f_old_opt.as_mut().expect("old file must exist");
+                            process_chunk_split(
+                                deps,
+                                &task.kind,
+                                &mut buf,
+                                threshold,
+                                &mut f_new,
+                                f_old,
+                                &mut cnt_new,
+                                &mut cnt_old,
+                                &mut unique,
+                                &mut preview_entries,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+
+            Ok(())
+        }
+        .await;
+
+        match query_result {
+            Ok(()) => break,
+            Err(err) if attempt < 2 => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(250 * (attempt as u64))).await;
+                continue;
+            }
+            Err(err) => return Err(err.context("clickhouse query failed after retries")),
         }
     }
 
