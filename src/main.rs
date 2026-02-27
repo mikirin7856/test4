@@ -56,25 +56,9 @@ async fn main() -> Result<()> {
     // ==========================
     let (db_tx, db_rx) = mpsc::channel::<queue::DbTask>(cfg.db_queue_maxsize);
 
-    let mut ch_options = clickhouse_rs::Options::default()
-        .with_host(cfg.ch_host.clone())
-        .with_port(cfg.ch_port)
-        .with_database(cfg.ch_database.clone())
-        .with_username(cfg.ch_user.clone())
-        .with_password(cfg.ch_password.clone())
-        .with_ping_before_query(true)
-        .with_send_retries(2)
-        .with_retry_timeout(std::time::Duration::from_secs(1));
-
-    if cfg.ch_secure {
-        ch_options = ch_options.with_secure(true);
-    }
-
-    if cfg.ch_compression {
-        ch_options = ch_options.with_compression(clickhouse_rs::CompressionMethod::Lz4);
-    }
-
-    let clickhouse_pool = clickhouse_rs::Pool::new(ch_options);
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(cfg.query_timeout))
+        .build()?;
 
     let (trigger, shutdown) = shutdown_channel();
 
@@ -83,7 +67,7 @@ async fn main() -> Result<()> {
     // ==========================
     let worker_deps = WorkerDeps {
         cfg: cfg.clone(),
-        clickhouse_pool,
+        http,
         active_requests: active_requests.clone(),
         bot: bot.clone(),
         sold_store: sold_store.clone(),

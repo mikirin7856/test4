@@ -8,8 +8,6 @@ pub struct Config {
 
     pub ch_host: String,
     pub ch_port: u16,
-    pub ch_secure: bool,
-    pub ch_compression: bool,
     pub ch_user: String,
     pub ch_password: String,
     pub ch_database: String,
@@ -28,14 +26,8 @@ impl Config {
 
         let ch_host = std::env::var("CH_HOST").unwrap_or_else(|_| "localhost".into());
         let ch_port = std::env::var("CH_PORT")
-            .unwrap_or_else(|_| "9000".into())
+            .unwrap_or_else(|_| "8123".into())
             .parse()?;
-        let ch_secure = std::env::var("CH_SECURE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let ch_compression = std::env::var("CH_COMPRESSION")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(true);
         let ch_user = std::env::var("CH_USER").unwrap_or_else(|_| "default".into());
         let ch_password = std::env::var("CH_PASSWORD").unwrap_or_else(|_| "test".into());
         let ch_database = std::env::var("CH_DATABASE").unwrap_or_else(|_| "default".into());
@@ -52,8 +44,6 @@ impl Config {
             bot_token,
             ch_host,
             ch_port,
-            ch_secure,
-            ch_compression,
             ch_user,
             ch_password,
             ch_database,
@@ -61,5 +51,9 @@ impl Config {
             db_queue_maxsize,
             query_timeout,
         })
+    }
+
+    pub fn ch_base_url(&self) -> String {
+        format!("http://{}:{}/", self.ch_host, self.ch_port)
     }
 }
